@@ -52,8 +52,10 @@ describe('Router', () => {
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run('groq', 'test', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1);
 
+    // Post-V4: Groq's openai/gpt-oss-120b (rank 6) outranks Google's best free
+    // model gemini-2.5-pro (rank 14, demoted as at-risk after April 2026 free-tier cut).
     const result = routeRequest();
-    expect(result.platform).toBe('google');
+    expect(result.platform).toBe('groq');
   });
 
   it('should skip disabled keys', () => {

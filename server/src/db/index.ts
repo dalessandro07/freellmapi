@@ -38,6 +38,7 @@ export function initDb(dbPath?: string): Database.Database {
   migrateModels(db);
   migrateModelsV2(db);
   migrateModelsV3Ranks(db);
+  migrateModelsV4(db);
   ensureUnifiedKey(db);
 
   console.log(`Database initialized at ${resolvedPath}`);
@@ -390,6 +391,167 @@ function migrateModelsV3Ranks(db: Database.Database) {
     }
   });
   apply();
+}
+
+/**
+ * V4: Agentic-tool-use focus. Live-probed every candidate against real free-tier
+ * keys (April 2026) with a weather-tool function-calling test. Keeps only models
+ * that return a structured tool_calls response and are reachable on the free tier.
+ *
+ * Adds SambaNova DeepSeek/Llama-4/gpt-oss, Groq gpt-oss & qwen3-32b, OpenRouter
+ * ling-2.6-flash + nemotron-nano + gpt-oss + trinity, Mistral devstral/medium,
+ * GitHub gpt-4.1, Cohere command-a, Cloudflare llama-4/gpt-oss/glm-4.7. Removes
+ * moonshot/kimi (paid-only now), minimax/M1 (superseded), HF/Fireworks route
+ * (no structured tools), OR/gemma-4 (weak at tools). Renames CF llama-3.1 → 3.3
+ * fp8-fast. Corrects stale limits.
+ */
+function migrateModelsV4(db: Database.Database) {
+  // 1) Remove entries that are unavailable or fail agentic tool use
+  const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
+  const deleteFallback = db.prepare(`
+    DELETE FROM fallback_config WHERE model_db_id IN (
+      SELECT id FROM models WHERE platform = ? AND model_id = ?
+    )
+  `);
+  const removals: Array<[string, string]> = [
+    ['moonshot', 'kimi-latest'],                                            // paid-only now ($1 min deposit)
+    ['minimax', 'MiniMax-M1'],                                              // superseded; use OR minimax-m2.5:free
+    ['openrouter', 'google/gemma-4-31b-it:free'],                           // weak at tool use
+    ['huggingface', 'accounts/fireworks/models/llama-v3p3-70b-instruct'],  // emits tool call as text content, not structured
+  ];
+  const applyRemovals = db.transaction(() => {
+    for (const [p, m] of removals) {
+      deleteFallback.run(p, m);
+      deleteModel.run(p, m);
+    }
+  });
+  applyRemovals();
+
+  // 2) Cloudflare: replace Llama 3.1 70B with the current-gen 3.3 70B fp8-fast
+  db.prepare(`
+    UPDATE models
+       SET model_id = '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+           display_name = 'Llama 3.3 70B fp8-fast (CF)',
+           context_window = 131072
+     WHERE platform = 'cloudflare' AND model_id = '@cf/meta/llama-3.1-70b-instruct'
+  `).run();
+
+  // 3) Field corrections verified via primary sources + live probe
+  db.prepare(`UPDATE models SET tpm_limit = 12000 WHERE platform = 'groq' AND model_id = 'llama-3.3-70b-versatile'`).run();
+  db.prepare(`UPDATE models SET rpd_limit = 20 WHERE platform = 'sambanova' AND model_id = 'Meta-Llama-3.3-70B-Instruct'`).run();
+  db.prepare(`UPDATE models SET rpd_limit = 14400 WHERE platform = 'cerebras' AND model_id = 'qwen-3-235b-a22b-instruct-2507'`).run();
+  db.prepare(`UPDATE models SET rpd_limit = 250, monthly_token_budget = '~25M' WHERE platform = 'google' AND model_id = 'gemini-2.5-flash'`).run();
+  // gemini-2.5-pro is at-risk: April 2026 Google moved Pro-class off free tier in practice.
+  // Our live probe hit "quota exceeded" immediately. Cut rpd in half to reduce 429 blast radius.
+  db.prepare(`UPDATE models SET rpd_limit = 50, monthly_token_budget = '~6M' WHERE platform = 'google' AND model_id = 'gemini-2.5-pro'`).run();
+
+  // 4) Add live-probed, tool-capable models
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const additions: Array<[string, string, string, number, number, string, number | null, number | null, number | null, number | null, string, number | null]> = [
+    // OpenRouter :free — shared 20 RPM / 200 RPD / ~6M tokens across :free pool
+    ['openrouter', 'inclusionai/ling-2.6-flash:free',        'Ling 2.6 Flash (free)',         7,  9,  'Large',    20, 200, null, null, '~6M', 262144],
+    ['openrouter', 'arcee-ai/trinity-large-preview:free',    'Trinity Large Preview (free)',  13, 9,  'Frontier', 20, 200, null, null, '~6M', 131072],
+    ['openrouter', 'nvidia/nemotron-3-nano-30b-a3b:free',    'Nemotron 3 Nano 30B (free)',    22, 9,  'Medium',   20, 200, null, null, '~6M', 262144],
+    ['openrouter', 'openai/gpt-oss-120b:free',               'GPT-OSS 120B (free)',           6,  9,  'Large',    20, 200, null, null, '~6M', 131072],
+    ['openrouter', 'openai/gpt-oss-20b:free',                'GPT-OSS 20B (free)',            18, 9,  'Medium',   20, 200, null, null, '~6M', 131072],
+    ['openrouter', 'meta-llama/llama-3.3-70b-instruct:free', 'Llama 3.3 70B (free)',          17, 9,  'Medium',   20, 200, null, null, '~6M', 131072],
+
+    // SambaNova — 20 RPM / 20 RPD / 200K TPD shared free Developer tier
+    ['sambanova',  'DeepSeek-V3.1',                          'DeepSeek V3.1',                 5,  9,  'Frontier', 20, 20,  null, 200000, '~3M', 131072],
+    ['sambanova',  'DeepSeek-V3.2',                          'DeepSeek V3.2',                 4,  9,  'Frontier', 20, 20,  null, 200000, '~3M', 131072],
+    ['sambanova',  'Llama-4-Maverick-17B-128E-Instruct',     'Llama 4 Maverick',              11, 9,  'Large',    20, 20,  null, 200000, '~3M', 8192],
+    ['sambanova',  'gpt-oss-120b',                           'GPT-OSS 120B (SambaNova)',      6,  9,  'Large',    20, 20,  null, 200000, '~3M', 131072],
+
+    // Groq — very fast; 30 RPM per model, 1000 RPD on most, 14.4k on the 8B
+    ['groq',       'openai/gpt-oss-120b',                    'GPT-OSS 120B (Groq)',           6,  2,  'Large',    30, 1000, 8000, 200000,  '~6M',  131072],
+    ['groq',       'openai/gpt-oss-20b',                     'GPT-OSS 20B (Groq)',            18, 2,  'Medium',   30, 1000, 8000, 200000,  '~6M',  131072],
+    ['groq',       'qwen/qwen3-32b',                         'Qwen3 32B (Groq)',              19, 2,  'Medium',   60, 1000, 6000, 500000,  '~15M', 131072],
+    ['groq',       'llama-3.1-8b-instant',                   'Llama 3.1 8B Instant',          28, 2,  'Small',    30, 14400, 6000, 500000, '~15M', 131072],
+
+    // Mistral Experiment tier — shared 2 RPM / 500k TPM / 1B tokens/mo across all models
+    ['mistral',    'devstral-latest',                        'Devstral',                      16, 8,  'Medium',   2, null, 500000, null, '~50-100M', 131072],
+    ['mistral',    'mistral-medium-latest',                  'Mistral Medium 3.5',            14, 8,  'Large',    2, null, 500000, null, '~50-100M', 131072],
+
+    // GitHub Models — Low-tier category (15 RPM / 150 RPD, 8K in / 4K out per call)
+    ['github',     'openai/gpt-4.1',                         'GPT-4.1 (GitHub)',              20, 7,  'Large',    10, 50,  null, null, '~9M', 128000],
+
+    // Cohere — shared 1000 calls/mo trial pool, 20 RPM Chat
+    ['cohere',     'command-a-03-2025',                      'Command-A (03-2025)',           27, 11, 'Large',    20, 33,  null, null, '~1-2M', 131072],
+
+    // Cloudflare Workers AI — shared 10K Neurons/day free pool across all @cf/* models
+    ['cloudflare', '@cf/openai/gpt-oss-120b',                'GPT-OSS 120B (CF)',             6,  11, 'Large',    null, null, null, null, '~18-45M', 131072],
+    ['cloudflare', '@cf/zai-org/glm-4.7-flash',              'GLM-4.7 Flash (CF)',            10, 11, 'Large',    null, null, null, null, '~18-45M', 131072],
+    ['cloudflare', '@cf/meta/llama-4-scout-17b-16e-instruct', 'Llama 4 Scout (CF)',            12, 11, 'Large',    null, null, null, null, '~18-45M', 131072],
+  ];
+
+  const apply = db.transaction(() => {
+    for (const a of additions) insert.run(...a);
+    const missing = db.prepare(`
+      SELECT m.id FROM models m
+      LEFT JOIN fallback_config f ON m.id = f.model_db_id
+      WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
+    `).all() as { id: number }[];
+    if (missing.length > 0) {
+      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+      for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
+    }
+  });
+  apply();
+
+  // 5) Re-rank the live catalog by agentic tool-use capability (lower = smarter).
+  //    Grounded in April 2026 SWE-Bench Verified + BFCL v3 + Tau-Bench numbers.
+  const setRank = db.prepare(`UPDATE models SET intelligence_rank = ? WHERE platform = ? AND model_id = ?`);
+  const ranks: Array<[number, string, string]> = [
+    [1,  'openrouter',  'minimax/minimax-m2.5:free'],
+    [2,  'openrouter',  'qwen/qwen3-coder:free'],
+    [3,  'openrouter',  'qwen/qwen3-next-80b-a3b-instruct:free'],
+    [4,  'sambanova',   'DeepSeek-V3.2'],
+    [5,  'sambanova',   'DeepSeek-V3.1'],
+    [6,  'cerebras',    'qwen-3-235b-a22b-instruct-2507'],
+    [6,  'openrouter',  'openai/gpt-oss-120b:free'],
+    [6,  'groq',        'openai/gpt-oss-120b'],
+    [6,  'sambanova',   'gpt-oss-120b'],
+    [6,  'cloudflare',  '@cf/openai/gpt-oss-120b'],
+    [7,  'openrouter',  'inclusionai/ling-2.6-flash:free'],
+    [8,  'openrouter',  'z-ai/glm-4.5-air:free'],
+    [10, 'cloudflare',  '@cf/zai-org/glm-4.7-flash'],
+    [11, 'sambanova',   'Llama-4-Maverick-17B-128E-Instruct'],
+    [12, 'groq',        'meta-llama/llama-4-scout-17b-16e-instruct'],
+    [12, 'cloudflare',  '@cf/meta/llama-4-scout-17b-16e-instruct'],
+    [13, 'openrouter',  'arcee-ai/trinity-large-preview:free'],
+    [14, 'google',      'gemini-2.5-pro'],
+    [14, 'mistral',     'mistral-large-latest'],
+    [14, 'mistral',     'mistral-medium-latest'],
+    [16, 'mistral',     'devstral-latest'],
+    [16, 'mistral',     'codestral-latest'],
+    [17, 'groq',        'llama-3.3-70b-versatile'],
+    [17, 'sambanova',   'Meta-Llama-3.3-70B-Instruct'],
+    [17, 'cloudflare',  '@cf/meta/llama-3.3-70b-instruct-fp8-fast'],
+    [17, 'openrouter',  'meta-llama/llama-3.3-70b-instruct:free'],
+    [17, 'nvidia',      'meta/llama-3.1-70b-instruct'],
+    [18, 'openrouter',  'openai/gpt-oss-20b:free'],
+    [18, 'groq',        'openai/gpt-oss-20b'],
+    [19, 'groq',        'qwen/qwen3-32b'],
+    [20, 'google',      'gemini-2.5-flash'],
+    [20, 'github',      'openai/gpt-4.1'],
+    [21, 'mistral',     'magistral-medium-latest'],
+    [22, 'openrouter',  'nvidia/nemotron-3-super-120b-a12b:free'],
+    [23, 'openrouter',  'nvidia/nemotron-3-nano-30b-a3b:free'],
+    [24, 'zhipu',       'glm-4.5-flash'],
+    [25, 'github',      'gpt-4o'],
+    [26, 'google',      'gemini-2.5-flash-lite'],
+    [27, 'cohere',      'command-a-03-2025'],
+    [27, 'cohere',      'command-r-plus-08-2024'],
+    [28, 'groq',        'llama-3.1-8b-instant'],
+  ];
+  const applyRanks = db.transaction(() => {
+    for (const [r, p, m] of ranks) setRank.run(r, p, m);
+  });
+  applyRanks();
 }
 
 function ensureUnifiedKey(db: Database.Database) {
