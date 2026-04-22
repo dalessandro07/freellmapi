@@ -3,16 +3,39 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "main": "./types.ts",
-  "types": "./types.ts",
+  "main": "./dist/types.js",
+  "types": "./dist/types.d.ts",
   "exports": {
-    ".": "./types.ts",
-    "./types": "./types.ts",
-    "./types.js": "./types.ts",
-    "./validate-username": "./validate-username.ts",
-    "./validate-username.js": "./validate-username.ts"
+    ".": {
+      "types": "./dist/types.d.ts",
+      "default": "./dist/types.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "default": "./dist/types.js"
+    },
+    "./types.js": {
+      "types": "./dist/types.d.ts",
+      "default": "./dist/types.js"
+    },
+    "./validate-username": {
+      "types": "./dist/validate-username.d.ts",
+      "default": "./dist/validate-username.js"
+    },
+    "./validate-username.js": {
+      "types": "./dist/validate-username.d.ts",
+      "default": "./dist/validate-username.js"
+    }
   },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput"
+  },
+  "files": ["dist"],
   "dependencies": {
     "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
   }
 }
