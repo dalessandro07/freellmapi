@@ -12,9 +12,7 @@
   },
   "dependencies": {
     "@freellmapi/shared": "*",
-    "@types/bcryptjs": "^2.4.6",
-    "bcryptjs": "^3.0.3",
-    "better-sqlite3": "^11.8.1",
+    "better-sqlite3": "^12.4.1",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.44.2",
