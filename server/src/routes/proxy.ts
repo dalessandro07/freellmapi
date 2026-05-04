@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
@@ -15,12 +16,14 @@ const stickySessionMap = new Map<string, { modelDbId: number; lastUsed: number }
 const STICKY_TTL_MS = 30 * 60 * 1000; // 30 min session TTL
 
 function getSessionKey(messages: ChatMessage[]): string {
-  // Use the first user message as session identifier
-  // Hermes sends the full conversation each time, so first user msg is stable
+  // Use the first user message as session identifier — clients like Hermes
+  // re-send the full conversation each turn, so the first user message is
+  // stable across turns. Hash the FULL message (not a 100-char slice) so
+  // distinct conversations with identical openings don't collide.
   const firstUser = messages.find(m => m.role === 'user');
   if (!firstUser || typeof firstUser.content !== 'string') return '';
-  // Hash: first 100 chars of first user message + message count
-  return `${firstUser.content.slice(0, 100)}:${messages.length > 2 ? 'multi' : 'single'}`;
+  const hash = crypto.createHash('sha1').update(firstUser.content).digest('hex');
+  return `${hash}:${messages.length > 2 ? 'multi' : 'single'}`;
 }
 
 function getStickyModel(messages: ChatMessage[]): number | undefined {
@@ -165,13 +168,14 @@ function isRetryableError(err: any): boolean {
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const start = Date.now();
 
-  // Authenticate with unified API key (skip for local requests)
-  const authHeader = req.headers.authorization;
+  // Authenticate with unified API key. Local requests (127.0.0.1) skip the check
+  // since they came from the same machine running the server. Non-local requests
+  // MUST present a valid Bearer token — missing or wrong → 401.
   const isLocal = req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1';
-  if (authHeader && !isLocal) {
-    const token = authHeader.replace(/^Bearer\s+/i, '');
+  if (!isLocal) {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
     const unifiedKey = getUnifiedApiKey();
-    if (token !== unifiedKey) {
+    if (!token || token !== unifiedKey) {
       res.status(401).json({
         error: { message: 'Invalid API key', type: 'authentication_error' },
       });
@@ -191,7 +195,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
-  const { temperature, max_tokens, top_p, stream, tools, tool_choice, parallel_tool_calls } = parsed.data;
+  const { model: requestedModel, temperature, max_tokens, top_p, stream, tools, tool_choice, parallel_tool_calls } = parsed.data;
   const messages: ChatMessage[] = parsed.data.messages.map((m): ChatMessage => {
     if (m.role === 'assistant') {
       return {
@@ -218,14 +222,43 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     };
   });
 
+  // Token estimation is intentionally a heuristic (~4 chars per token). Used
+  // for routing decisions (skip a model whose budget is too small) and for
+  // streaming bookkeeping where the provider doesn't echo a final usage count.
+  // Non-streaming requests reconcile against the provider's real `usage` block
+  // (see line ~340). Streaming will drift from real consumption — accepted
+  // tradeoff because per-request usage isn't always returned mid-stream.
   const estimatedInputTokens = messages.reduce((sum, m) => {
     if (typeof m.content !== 'string') return sum;
     return sum + Math.ceil(m.content.length / 4);
   }, 0);
   const estimatedTotal = estimatedInputTokens + (max_tokens ?? 1000);
 
-  // Sticky session: prefer the same model for multi-turn conversations
-  const preferredModel = getStickyModel(messages);
+  // Explicit `model` field pins routing. If the catalog has no enabled row
+  // matching the requested id, return 400 — silently auto-routing to a
+  // different model would be surprising to OpenAI-compatible clients.
+  // Sticky-session is the fallback when no `model` field was sent at all.
+  let preferredModel: number | undefined;
+  if (requestedModel) {
+    const db = getDb();
+    const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+    if (enabled) {
+      preferredModel = enabled.id;
+    } else {
+      const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
+      const reason = disabled ? 'is disabled' : 'is not in the catalog';
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' ${reason}. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+  } else {
+    preferredModel = getStickyModel(messages);
+  }
 
   // Retry loop: on 429/rate limit, skip that model+key and try the next one
   const skipKeys = new Set<string>();
@@ -256,33 +289,57 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
     try {
       if (stream) {
-        // Streaming - can't retry once we start writing
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-        if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
-
+        // Lazy header set: pre-stream errors stay retryable (no headers sent yet);
+        // mid-stream errors emit an `error` SSE frame so the client sees a real signal
+        // instead of a silently truncated stream.
         let totalOutputTokens = 0;
-        const gen = route.provider.streamChatCompletion(
-          route.apiKey, messages, route.modelId,
-          { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls },
-        );
+        let streamStarted = false;
+        try {
+          const gen = route.provider.streamChatCompletion(
+            route.apiKey, messages, route.modelId,
+            { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls },
+          );
 
-        for await (const chunk of gen) {
-          const text = chunk.choices[0]?.delta?.content ?? '';
-          totalOutputTokens += Math.ceil(text.length / 4);
-          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          for await (const chunk of gen) {
+            if (!streamStarted) {
+              res.setHeader('Content-Type', 'text/event-stream');
+              res.setHeader('Cache-Control', 'no-cache');
+              res.setHeader('Connection', 'keep-alive');
+              res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+              if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+              streamStarted = true;
+            }
+            const text = chunk.choices[0]?.delta?.content ?? '';
+            totalOutputTokens += Math.ceil(text.length / 4);
+            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          }
+
+          if (!streamStarted) {
+            // Upstream returned no chunks — emit minimal successful stream.
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+          }
+          res.write('data: [DONE]\n\n');
+          res.end();
+
+          recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
+          recordSuccess(route.modelDbId);
+          setStickyModel(messages, route.modelDbId);
+          logRequest(route.platform, route.modelId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
+          return;
+        } catch (streamErr: any) {
+          if (streamStarted) {
+            // Mid-stream error — finish the SSE response cleanly instead of leaving
+            // the client hanging or letting Express's default handler take over.
+            const payload = { error: { message: `Provider error (${route.displayName}): ${streamErr.message}`, type: 'stream_error' } };
+            try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
+            try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
+            logRequest(route.platform, route.modelId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, streamErr.message);
+            return;
+          }
+          // Pre-stream error — bubble to outer retry/502 handler.
+          throw streamErr;
         }
-
-        res.write('data: [DONE]\n\n');
-        res.end();
-
-        recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
-        recordSuccess(route.modelDbId);
-        setStickyModel(messages, route.modelDbId);
-        logRequest(route.platform, route.modelId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
-        return;
       } else {
         const result = await route.provider.chatCompletion(
           route.apiKey, messages, route.modelId,

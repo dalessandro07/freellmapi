@@ -41,6 +41,9 @@ export function initDb(dbPath?: string): Database.Database {
   migrateModelsV4(db);
   migrateModelsV5(db);
   migrateModelsV6(db);
+  migrateModelsV7(db);
+  migrateModelsV8(db);
+  migrateModelsV9(db);
   ensureUnifiedKey(db);
 
   console.log(`Database initialized at ${resolvedPath}`);
@@ -670,6 +673,117 @@ function migrateModelsV6(db: Database.Database) {
     }
   });
   apply();
+}
+
+/**
+ * V7 (April 2026): live-probed delta against OpenRouter's free pool + Z.ai.
+ * - Removes inclusionai/ling-2.6-flash:free (transitioned to paid, 404 on chat).
+ * - Adds 8 new :free routes confirmed via /v1/models + chat-completion probe.
+ * - Adds zhipu/glm-4.7-flash (probe: 429 "overloaded" — free-pool throttle, not
+ *   "insufficient balance" which paid models return). Same baseUrl works for both
+ *   api.z.ai and open.bigmodel.cn keys.
+ * HF and NVIDIA left as-is: HF still serves chat with current key; NVIDIA already disabled.
+ */
+function migrateModelsV7(db: Database.Database) {
+  const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
+  const deleteFallback = db.prepare(`
+    DELETE FROM fallback_config WHERE model_db_id IN (
+      SELECT id FROM models WHERE platform = ? AND model_id = ?
+    )
+  `);
+  const removals: Array<[string, string]> = [
+    ['openrouter', 'inclusionai/ling-2.6-flash:free'],
+  ];
+  const applyRemovals = db.transaction(() => {
+    for (const [p, m] of removals) {
+      deleteFallback.run(p, m);
+      deleteModel.run(p, m);
+    }
+  });
+  applyRemovals();
+
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  // OpenRouter :free quotas: 20 RPM / 50 RPD without credits, 1000 RPD with $10 lifetime topup.
+  // Catalog convention is rpd=200 (matches existing rows).
+  const additions: Array<[string, string, string, number, number, string, number | null, number | null, number | null, number | null, string, number | null]> = [
+    ['openrouter', 'inclusionai/ling-2.6-1t:free',                           'Ling 2.6 1T (free)',                       4,  9,  'Frontier', 20, 200, null, null, '~6M', 262144],
+    ['openrouter', 'tencent/hy3-preview:free',                               'Tencent HY3 Preview (free)',               7,  9,  'Frontier', 20, 200, null, null, '~6M', 262144],
+    ['openrouter', 'poolside/laguna-m.1:free',                               'Poolside Laguna M.1 (free)',               13, 9,  'Large',    20, 200, null, null, '~6M', 131072],
+    ['openrouter', 'google/gemma-4-26b-a4b-it:free',                         'Gemma 4 26B-A4B (free)',                   22, 9,  'Medium',   20, 200, null, null, '~6M', 262144],
+    ['openrouter', 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',     'Nemotron 3 Nano 30B Reasoning (free)',     23, 9,  'Medium',   20, 200, null, null, '~6M', 262144],
+    ['openrouter', 'poolside/laguna-xs.2:free',                              'Poolside Laguna XS.2 (free)',              26, 10, 'Medium',   20, 200, null, null, '~6M', 131072],
+    ['openrouter', 'nvidia/nemotron-nano-9b-v2:free',                        'Nemotron Nano 9B v2 (free)',               28, 10, 'Medium',   20, 200, null, null, '~6M', 128000],
+    ['openrouter', 'liquid/lfm-2.5-1.2b-thinking:free',                      'Liquid LFM 2.5 1.2B Thinking (free)',      30, 10, 'Small',    20, 200, null, null, '~6M', 32768],
+    // Zhipu (Z.ai) — free pool. glm-4.7-flash quotas unpublished; mirror glm-4.5-flash row shape.
+    ['zhipu',      'glm-4.7-flash',                                          'GLM-4.7 Flash',                            18, 4,  'Large',    null, null, null, 1000000, '~30M', 131072],
+  ];
+  const apply = db.transaction(() => {
+    for (const a of additions) insert.run(...a);
+    const missing = db.prepare(`
+      SELECT m.id FROM models m
+      LEFT JOIN fallback_config f ON m.id = f.model_db_id
+      WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
+    `).all() as { id: number }[];
+    if (missing.length > 0) {
+      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+      for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
+    }
+  });
+  apply();
+}
+
+/**
+ * V8 (May 2026): 3-day delta. SambaNova's /v1/models added two free-tier models;
+ * Cloudflare's @cf catalog added two new text models. All four probe-verified 200
+ * with the user's keys. SambaNova's paid-only MiniMax-M2.5 explicitly returns 422
+ * "Couldn't find valid service tier", so the 200s on these rows confirm free-tier
+ * access. Cloudflare's @cf/* models share the 10K Neurons/day free pool.
+ */
+function migrateModelsV8(db: Database.Database) {
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const additions: Array<[string, string, string, number, number, string, number | null, number | null, number | null, number | null, string, number | null]> = [
+    // SambaNova free pool: 20 RPM / 20 RPD / 200K TPD shared across all free models.
+    ['sambanova',  'DeepSeek-V3.1-cb',                          'DeepSeek V3.1 (CB)',             5,  9,  'Frontier', 20, 20, null, 200000, '~3M',     131072],
+    ['sambanova',  'gemma-3-12b-it',                            'Gemma 3 12B (SambaNova)',        22, 9,  'Medium',   20, 20, null, 200000, '~3M',     131072],
+    // Cloudflare @cf — 10K Neurons/day shared pool.
+    ['cloudflare', '@cf/moonshotai/kimi-k2.6',                  'Kimi K2.6 (CF)',                 2,  11, 'Frontier', null, null, null, null, '~10-20M', 262144],
+    ['cloudflare', '@cf/ibm-granite/granite-4.0-h-micro',       'Granite 4.0 H Micro (CF)',       29, 11, 'Small',    null, null, null, null, '~5-10M',  131072],
+  ];
+  const apply = db.transaction(() => {
+    for (const a of additions) insert.run(...a);
+    const missing = db.prepare(`
+      SELECT m.id FROM models m
+      LEFT JOIN fallback_config f ON m.id = f.model_db_id
+      WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
+    `).all() as { id: number }[];
+    if (missing.length > 0) {
+      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+      for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
+    }
+  });
+  apply();
+}
+
+/**
+ * V9 (May 2026): disable cerebras/zai-glm-4.7. The model still appears in
+ * Cerebras's /v1/models listing but the chat-completions endpoint returns
+ * 404 "Model does not exist or you do not have access" for free-tier keys —
+ * matches their docs note about temporarily reducing free-tier access on
+ * zai-glm-4.7 due to high demand. Row kept (not deleted) so it can be
+ * re-enabled later without losing fallback_config history.
+ */
+function migrateModelsV9(db: Database.Database) {
+  db.prepare(
+    "UPDATE models SET enabled = 0 WHERE platform = 'cerebras' AND model_id = 'zai-glm-4.7'"
+  ).run();
 }
 
 function ensureUnifiedKey(db: Database.Database) {

@@ -4,7 +4,6 @@ import { GoogleProvider } from './google.js';
 import { OpenAICompatProvider } from './openai-compat.js';
 import { CohereProvider } from './cohere.js';
 import { CloudflareProvider } from './cloudflare.js';
-import { HuggingFaceProvider } from './huggingface.js';
 
 const providers = new Map<Platform, BaseProvider>();
 
@@ -61,11 +60,13 @@ register(new OpenAICompatProvider({
   },
 }));
 
-// GitHub Models - OpenAI-compatible via Azure endpoint
+// GitHub Models — OpenAI-compatible. Catalog uses `<publisher>/<model>` ids
+// (e.g. `openai/gpt-4.1`); the old Azure endpoint rejects that prefix with
+// "Unknown model", so route to the current models.github.ai endpoint.
 register(new OpenAICompatProvider({
   platform: 'github',
   name: 'GitHub Models',
-  baseUrl: 'https://models.inference.ai.azure.com',
+  baseUrl: 'https://models.github.ai/inference',
 }));
 
 // Cohere - OpenAI-compatible via Cohere compatibility endpoint
@@ -74,9 +75,6 @@ register(new CohereProvider());
 // Cloudflare Workers AI - OpenAI-compatible endpoint (key = "account_id:token")
 register(new CloudflareProvider());
 
-// Hugging Face - OpenAI-compatible per-model endpoint
-register(new HuggingFaceProvider());
-
 // Zhipu (Z.ai / bigmodel.cn) - OpenAI-compatible
 register(new OpenAICompatProvider({
   platform: 'zhipu',
@@ -84,19 +82,9 @@ register(new OpenAICompatProvider({
   baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
 }));
 
-// Moonshot (Kimi) - OpenAI-compatible
-register(new OpenAICompatProvider({
-  platform: 'moonshot',
-  name: 'Moonshot',
-  baseUrl: 'https://api.moonshot.ai/v1',
-}));
-
-// MiniMax - OpenAI-compatible
-register(new OpenAICompatProvider({
-  platform: 'minimax',
-  name: 'MiniMax',
-  baseUrl: 'https://api.minimax.io/v1',
-}));
+// Hugging Face, Moonshot, MiniMax direct integrations were dropped in V4 —
+// HF tool-call format issues; Moonshot moved to paid; MiniMax superseded by
+// the OpenRouter route (openrouter/minimax/minimax-m2.5:free).
 
 export function getProvider(platform: Platform): BaseProvider | undefined {
   return providers.get(platform);

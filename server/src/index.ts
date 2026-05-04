@@ -1,4 +1,4 @@
-import './loadEnv.js';
+import './env.js';
 import { createApp } from './app.js';
 import { initDb } from './db/index.js';
 import { validateSessionPasswordOrExit } from './lib/validateEnv.js';

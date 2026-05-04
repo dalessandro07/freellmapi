@@ -17,12 +17,9 @@ const PLATFORMS: { value: Platform; label: string }[] = [
   { value: 'mistral', label: 'Mistral' },
   { value: 'openrouter', label: 'OpenRouter' },
   { value: 'github', label: 'GitHub Models' },
-  { value: 'huggingface', label: 'Hugging Face' },
   { value: 'cohere', label: 'Cohere' },
   { value: 'cloudflare', label: 'Cloudflare Workers AI' },
   { value: 'zhipu', label: 'Zhipu AI (Z.ai)' },
-  { value: 'moonshot', label: 'Moonshot (Kimi)' },
-  { value: 'minimax', label: 'MiniMax' },
 ]
 
 const statusDot: Record<string, string> = {
@@ -73,6 +70,9 @@ function UnifiedKeySection() {
 
   const apiKey = data?.apiKey ?? ''
   const masked = apiKey ? apiKey.slice(0, 13) + '•'.repeat(32) : '…'
+  const baseUrl = import.meta.env.DEV
+    ? `http://${window.location.hostname}:${__SERVER_PORT__}/v1`
+    : `${window.location.origin}/v1`
 
   function copy() {
     navigator.clipboard.writeText(apiKey)
@@ -113,7 +113,7 @@ function UnifiedKeySection() {
 
       <div className="mt-4 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
         <span className="text-muted-foreground">Base URL</span>
-        <code className="font-mono">http://localhost:3001/v1</code>
+        <code className="font-mono">{baseUrl}</code>
         <span className="text-muted-foreground">Endpoint</span>
         <code className="font-mono">/v1/chat/completions</code>
       </div>
