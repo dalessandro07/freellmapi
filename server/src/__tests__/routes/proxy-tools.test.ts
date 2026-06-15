@@ -1,16 +1,19 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
-import { initDb, getDb } from '../../db/index.js';
+import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
+import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 
-async function request(app: Express, method: string, path: string, body?: any) {
+let dashToken = '';
+
+async function request(app: Express, method: string, path: string, body?: any, headers: Record<string, string> = {}) {
   const server = app.listen(0);
   const addr = server.address() as any;
   const url = `http://127.0.0.1:${addr.port}${path}`;
 
   const res = await fetch(url, {
     method,
-    headers: body ? { 'Content-Type': 'application/json' } : {},
+    headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(isGatedApiPath(path) && !('Authorization' in headers) ? { Authorization: `Bearer ${dashToken}` } : {}), ...headers },
     body: body ? JSON.stringify(body) : undefined,
   });
 
@@ -23,6 +26,10 @@ async function request(app: Express, method: string, path: string, body?: any) {
   return { status: res.status, body: json, headers: res.headers, raw: data };
 }
 
+function authHeaders() {
+  return { Authorization: `Bearer ${getUnifiedApiKey()}` };
+}
+
 describe('Proxy tool-calling support', () => {
   let app: Express;
 
@@ -30,6 +37,7 @@ describe('Proxy tool-calling support', () => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
     initDb(':memory:');
     app = createApp();
+    dashToken = mintDashboardToken();
   });
 
   beforeEach(async () => {
@@ -103,7 +111,7 @@ describe('Proxy tool-calling support', () => {
         },
       }],
       tool_choice: 'required',
-    });
+    }, authHeaders());
 
     expect(status).toBe(200);
     expect(providerBody.tools).toHaveLength(1);
@@ -163,7 +171,7 @@ describe('Proxy tool-calling support', () => {
           content: '{"temp_c":30}',
         },
       ],
-    });
+    }, authHeaders());
 
     expect(status).toBe(200);
     expect(providerBody.messages[1].role).toBe('assistant');
@@ -172,5 +180,44 @@ describe('Proxy tool-calling support', () => {
     expect(providerBody.messages[2].role).toBe('tool');
     expect(providerBody.messages[2].tool_call_id).toBe('call_weather_1');
     expect(body.choices[0].message.content).toContain('30C');
+  });
+
+  it('round-trips assistant reasoning_content on follow-up turns (DeepSeek thinking — #255)', async () => {
+    const origFetch = global.fetch;
+    let providerBody: any = null;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
+        providerBody = JSON.parse((init as any).body);
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            id: 'chatcmpl-r', object: 'chat.completion', created: 1, model: 'm',
+            choices: [{ index: 0, message: { role: 'assistant', content: 'done' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+          }),
+        } as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const { status } = await request(app, 'POST', '/v1/chat/completions', {
+      messages: [
+        { role: 'user', content: 'think then answer' },
+        {
+          role: 'assistant',
+          content: 'partial',
+          // What a DeepSeek thinking model returned last turn and the client
+          // replayed. Stripping it makes OpenCode Zen 400 on this request.
+          reasoning_content: 'Let me reason about this step by step...',
+        },
+        { role: 'user', content: 'continue' },
+      ],
+    }, authHeaders());
+
+    expect(status).toBe(200);
+    expect(providerBody.messages[1].role).toBe('assistant');
+    expect(providerBody.messages[1].reasoning_content).toBe('Let me reason about this step by step...');
   });
 });

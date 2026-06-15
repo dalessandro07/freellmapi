@@ -1,17 +1,49 @@
-import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useLocation } from 'react-router-dom'
+import { useEffect, useState } from 'react'
+import { BrowserRouter, Routes, Route, Navigate, NavLink, Link, useLocation, useNavigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { AppBrand } from '@/components/brand'
-import { DarkModeToggle } from '@/components/dark-mode-toggle'
-import { Button } from '@/components/ui/button'
+import { Languages, Menu, MoreHorizontal, Moon, Sun } from 'lucide-react'
+import { buttonVariants } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { AuthGate } from '@/components/auth-gate'
+import { I18nProvider, useI18n, SUPPORTED_LOCALES, type Locale } from '@/i18n'
+import { logout } from '@/lib/api'
 import KeysPage from '@/pages/KeysPage'
 import PlaygroundPage from '@/pages/PlaygroundPage'
 import FallbackPage from '@/pages/FallbackPage'
+import EmbeddingsPage from '@/pages/EmbeddingsPage'
 import AnalyticsPage from '@/pages/AnalyticsPage'
-import LoginPage from '@/pages/LoginPage'
-import SetupPage from '@/pages/SetupPage'
-import { useAuthStatus, useMe, useLogout } from '@/lib/auth'
+import PremiumPage from '@/pages/PremiumPage'
 
 const queryClient = new QueryClient()
+
+const navItems = [
+  { to: '/models', labelKey: 'nav.models' },
+  { to: '/playground', labelKey: 'nav.playground' },
+  { to: '/keys', labelKey: 'nav.keys' },
+  { to: '/analytics', labelKey: 'nav.analytics' },
+  { to: '/premium', labelKey: 'nav.premium' },
+]
+
+function getPreferredDarkMode() {
+  if (typeof window === 'undefined') {
+    return false
+  }
+
+  const stored = localStorage.getItem('theme')
+  return stored === 'dark' || (!stored && window.matchMedia('(prefers-color-scheme: dark)').matches)
+}
 
 function NavItem({ to, children }: { to: string; children: React.ReactNode }) {
   return (
@@ -30,103 +62,194 @@ function NavItem({ to, children }: { to: string; children: React.ReactNode }) {
   )
 }
 
-function UserMenu() {
-  const { data: me } = useMe()
-  const logout = useLogout()
-  const name = me?.user?.username ?? ''
+function useDarkMode() {
+  const [dark, setDark] = useState(getPreferredDarkMode)
 
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', dark)
+  }, [dark])
+
+  function toggle() {
+    setDark((current) => {
+      const next = !current
+      localStorage.setItem('theme', next ? 'dark' : 'light')
+      return next
+    })
+  }
+
+  return { dark, toggle }
+}
+
+function Brand() {
   return (
-    <div className="flex items-center gap-2">
-      {name && (
-        <span className="text-xs text-muted-foreground max-w-[120px] truncate" title={name}>
-          {name}
-        </span>
-      )}
-      <Button
-        variant="outline"
-        size="sm"
-        onClick={() => logout.mutate()}
-        disabled={logout.isPending}
-        type="button"
-      >
-        {logout.isPending ? '…' : 'Log out'}
-      </Button>
-    </div>
+    <Link to="/" className="flex items-center gap-2 transition-opacity hover:opacity-70">
+      <span className="inline-block size-2 rounded-full bg-foreground" />
+      <span className="font-semibold tracking-tight text-sm">FreeLLMAPI</span>
+    </Link>
   )
 }
 
-function RequireAuth({ children }: { children: React.ReactNode }) {
-  const { data: st, isLoading: stLoad } = useAuthStatus()
-  const { data: me, isLoading: meLoad } = useMe()
-  const location = useLocation()
+// True when the dashboard runs inside the desktop shell (Electron preload
+// sets this). The navbar then doubles as the window title bar: draggable,
+// padded for the macOS traffic lights, and without the web-only Sign out.
+const isDesktopApp = typeof window !== 'undefined' && (window as any).__FREEAPI_DESKTOP__ === true
 
-  if (stLoad || meLoad) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-background">
-        <p className="text-sm text-muted-foreground">Loading…</p>
-      </div>
-    )
-  }
-  if (st?.setupRequired) {
-    return <Navigate to="/setup" replace state={{ from: location }} />
-  }
-  if (!me?.user) {
-    return <Navigate to="/login" replace state={{ from: location }} />
-  }
-  return <>{children}</>
+// The preload's own early classList.add can be lost (it may run before this
+// document exists), so the client claims the class itself at module load —
+// before the first React paint — keeping html.desktop CSS (transparent body,
+// glass backdrop) reliable.
+if (isDesktopApp) {
+  document.documentElement.classList.add('desktop')
 }
 
-function AppShell() {
+// Language picker as a dropdown submenu, shared by the desktop (⋯) and mobile
+// (☰) menus. Radio items show a check on the active locale; selecting one calls
+// setLocale, which persists and re-renders every t() synchronously.
+function LanguageSubMenu() {
+  const { locale, setLocale, t } = useI18n()
   return (
-    <div className="min-h-screen bg-background">
-      <header className="sticky top-0 z-40 bg-background/80 backdrop-blur border-b">
-        <div className="max-w-6xl mx-auto px-6 flex items-center">
-          <AppBrand />
-          <nav className="flex items-center gap-6 ml-10">
-            <NavItem to="/playground">Playground</NavItem>
-            <NavItem to="/keys">Keys</NavItem>
-            <NavItem to="/fallback">Fallback</NavItem>
-            <NavItem to="/analytics">Analytics</NavItem>
-          </nav>
-          <div className="ml-auto py-2 flex items-center gap-2">
-            <UserMenu />
-            <DarkModeToggle />
-          </div>
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger className="gap-2">
+        <Languages className="size-4" />
+        <span>{t('nav.language')}</span>
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent>
+        <DropdownMenuRadioGroup value={locale} onValueChange={(v) => setLocale(v as Locale)}>
+          {SUPPORTED_LOCALES.map((code) => (
+            <DropdownMenuRadioItem key={code} value={code}>
+              {t(`languages.${code}`)}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  )
+}
+
+function Navbar() {
+  const { dark, toggle } = useDarkMode()
+  const { t } = useI18n()
+  const location = useLocation()
+  const navigate = useNavigate()
+
+  function isActiveRoute(to: string) {
+    return location.pathname === to
+  }
+
+  return (
+    <header
+      // In the desktop shell the body backdrop is already translucent glass;
+      // a lighter wash keeps the title bar from looking more solid than the page.
+      className={`sticky top-0 z-40 border-b backdrop-blur ${isDesktopApp ? 'bg-background/45' : 'bg-background/80'}`}
+      style={isDesktopApp ? ({ WebkitAppRegion: 'drag' } as React.CSSProperties) : undefined}
+    >
+      <div
+        className={`mx-auto flex max-w-6xl items-center px-4 sm:px-6 ${isDesktopApp ? 'pl-20 sm:pl-20' : ''}`}
+        style={isDesktopApp ? { minHeight: 52 } : undefined}
+      >
+        <Brand />
+        <nav
+          className="ml-10 hidden items-center gap-6 md:flex"
+          style={isDesktopApp ? ({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) : undefined}
+        >
+          {navItems.map((item) => (
+            <NavItem key={item.to} to={item.to}>
+              {t(item.labelKey)}
+            </NavItem>
+          ))}
+        </nav>
+        <div
+          className="ml-auto hidden items-center gap-1 md:flex"
+          style={isDesktopApp ? ({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) : undefined}
+        >
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              className={buttonVariants({ variant: 'ghost', size: 'icon' })}
+              aria-label={t('nav.openMenu')}
+            >
+              <MoreHorizontal />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-48">
+              <DropdownMenuItem onClick={toggle} className="justify-between">
+                <span>{t('nav.theme')}</span>
+                {dark ? <Sun /> : <Moon />}
+              </DropdownMenuItem>
+              <LanguageSubMenu />
+              {!isDesktopApp && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={() => logout()}>{t('nav.signOut')}</DropdownMenuItem>
+                </>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
-      </header>
-      <main className="max-w-6xl mx-auto px-6 py-8">
-        <Outlet />
-      </main>
-    </div>
+        <div className="ml-auto md:hidden">
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              className={buttonVariants({ variant: 'ghost', size: 'icon' })}
+              aria-label={t('nav.openMenu')}
+            >
+              <Menu />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-52">
+              <DropdownMenuGroup>
+                {navItems.map((item) => (
+                  <DropdownMenuItem
+                    key={item.to}
+                    onClick={() => navigate(item.to)}
+                    className={isActiveRoute(item.to) ? 'bg-accent text-accent-foreground font-medium' : undefined}
+                  >
+                    {t(item.labelKey)}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuGroup>
+                <DropdownMenuItem onClick={toggle} className="justify-between">
+                  <span>{t('nav.theme')}</span>
+                  {dark ? <Sun /> : <Moon />}
+                </DropdownMenuItem>
+                <LanguageSubMenu />
+                {!isDesktopApp && (
+                  <DropdownMenuItem onClick={() => logout()}>{t('nav.signOut')}</DropdownMenuItem>
+                )}
+              </DropdownMenuGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      </div>
+    </header>
   )
 }
 
 function App() {
   return (
     <QueryClientProvider client={queryClient}>
+      <I18nProvider>
       <BrowserRouter basename={import.meta.env.BASE_URL}>
-        <Routes>
-          <Route path="/login" element={<LoginPage />} />
-          <Route path="/setup" element={<SetupPage />} />
-          <Route
-            path="/"
-            element={
-              <RequireAuth>
-                <AppShell />
-              </RequireAuth>
-            }
-          >
-            <Route index element={<Navigate to="playground" replace />} />
-            <Route path="playground" element={<PlaygroundPage />} />
-            <Route path="keys" element={<KeysPage />} />
-            <Route path="fallback" element={<FallbackPage />} />
-            <Route path="analytics" element={<AnalyticsPage />} />
-            <Route path="test" element={<Navigate to="playground" replace />} />
-            <Route path="health" element={<Navigate to="keys" replace />} />
-            <Route path="*" element={<Navigate to="/playground" replace />} />
-          </Route>
-        </Routes>
+        <AuthGate>
+          <div className={`min-h-screen ${isDesktopApp ? 'desktop-backdrop' : 'bg-background'}`}>
+            <Navbar />
+            <main className="max-w-6xl mx-auto px-6 py-8">
+              <Routes>
+                <Route path="/" element={<Navigate to="/models/chat" replace />} />
+                <Route path="/models" element={<Navigate to="/models/chat" replace />} />
+                <Route path="/models/chat" element={<FallbackPage />} />
+                <Route path="/models/embeddings" element={<EmbeddingsPage />} />
+                <Route path="/playground" element={<PlaygroundPage />} />
+                <Route path="/keys" element={<KeysPage />} />
+                <Route path="/fallback" element={<Navigate to="/models/chat" replace />} />
+                <Route path="/analytics" element={<AnalyticsPage />} />
+                <Route path="/premium" element={<PremiumPage />} />
+                <Route path="/test" element={<Navigate to="/playground" replace />} />
+                <Route path="/health" element={<Navigate to="/keys" replace />} />
+              </Routes>
+            </main>
+          </div>
+        </AuthGate>
       </BrowserRouter>
+      </I18nProvider>
     </QueryClientProvider>
   )
 }

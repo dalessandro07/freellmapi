@@ -1,42 +1,61 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { getDb } from '../db/index.js';
+import { FALLBACK_INPUT_PER_M, FALLBACK_OUTPUT_PER_M } from '../db/model-pricing.js';
 
 export const analyticsRouter = Router();
 
-function getTimeFilter(range: string): string {
+// Format UTC timestamps the same way SQLite stores created_at text values.
+const toSqliteDateTime = (timestamp: number) =>
+    new Date(timestamp).toISOString().slice(0, 19).replace('T', ' ');
+
+// Return the rolling cutoff timestamp for the selected analytics range.
+function getSinceTimestamp(range: string): string {
+  const now = Date.now();
+
   switch (range) {
-    case '24h': return "datetime('now', '-1 day')";
-    case '7d': return "datetime('now', '-7 days')";
-    case '30d': return "datetime('now', '-30 days')";
-    default: return "datetime('now', '-7 days')";
+    case '24h':
+      return toSqliteDateTime(now - 24 * 60 * 60 * 1000);
+    case '30d':
+      return toSqliteDateTime(now - 30 * 24 * 60 * 60 * 1000);
+    case '7d':
+    default:
+      return toSqliteDateTime(now - 7 * 24 * 60 * 60 * 1000);
   }
 }
 
 // Summary stats
 analyticsRouter.get('/summary', (req: Request, res: Response) => {
   const range = (req.query.range as string) ?? '7d';
-  const since = getTimeFilter(range);
+  const since = getSinceTimestamp(range);
   const db = getDb();
 
+  // Savings are priced per request at the served model's paid-equivalent
+  // rate (models.paid_input_per_m / paid_output_per_m — see db/model-pricing.ts),
+  // with a modest fallback for custom/unmapped models, and only count
+  // successful requests. This is "what the same tokens would have cost on
+  // paid APIs", not a GPT-4o fantasy number.
   const stats = db.prepare(`
     SELECT
       COUNT(*) as total_requests,
-      SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
-      SUM(input_tokens) as total_input_tokens,
-      SUM(output_tokens) as total_output_tokens,
-      AVG(latency_ms) as avg_latency_ms
-    FROM requests
-    WHERE created_at >= ${since}
-  `).get() as any;
+      SUM(CASE WHEN r.status = 'success' THEN 1 ELSE 0 END) as success_count,
+      SUM(r.input_tokens) as total_input_tokens,
+      SUM(r.output_tokens) as total_output_tokens,
+      AVG(r.latency_ms) as avg_latency_ms,
+      MIN(r.created_at) as first_request_at,
+      SUM(CASE WHEN r.requested_model IS NOT NULL THEN 1 ELSE 0 END) as pinned_count,
+      SUM(CASE WHEN r.requested_model = r.model_id THEN 1 ELSE 0 END) as pin_honored_count,
+      SUM(CASE WHEN r.status = 'success' THEN
+        r.input_tokens  * COALESCE(m.paid_input_per_m,  ?) / 1000000.0 +
+        r.output_tokens * COALESCE(m.paid_output_per_m, ?) / 1000000.0
+      ELSE 0 END) as est_savings
+    FROM requests r
+    LEFT JOIN models m ON m.platform = r.platform AND m.model_id = r.model_id
+    WHERE r.created_at >= ?
+  `).get(FALLBACK_INPUT_PER_M, FALLBACK_OUTPUT_PER_M, since) as any;
 
   const totalRequests = stats.total_requests ?? 0;
   const successRate = totalRequests > 0 ? (stats.success_count / totalRequests) * 100 : 0;
-  const totalTokens = (stats.total_input_tokens ?? 0) + (stats.total_output_tokens ?? 0);
-
-  // Estimate cost savings: average ~$3/M input + $15/M output tokens (GPT-4o pricing)
-  const inputCost = ((stats.total_input_tokens ?? 0) / 1_000_000) * 3;
-  const outputCost = ((stats.total_output_tokens ?? 0) / 1_000_000) * 15;
 
   res.json({
     totalRequests,
@@ -44,14 +63,22 @@ analyticsRouter.get('/summary', (req: Request, res: Response) => {
     totalInputTokens: stats.total_input_tokens ?? 0,
     totalOutputTokens: stats.total_output_tokens ?? 0,
     avgLatencyMs: Math.round(stats.avg_latency_ms ?? 0),
-    estimatedCostSavings: Math.round((inputCost + outputCost) * 100) / 100,
+    estimatedCostSavings: Math.round((stats.est_savings ?? 0) * 100) / 100,
+    // Pinned = requests where the client named a specific model (not 'auto').
+    // Honored = the pinned model actually served it; the difference is
+    // failovers that overrode the pin.
+    pinnedRequests: stats.pinned_count ?? 0,
+    pinHonoredRequests: stats.pin_honored_count ?? 0,
+    // Lets the client project savings from the ACTUAL data span (a 2-day-old
+    // install shouldn't extrapolate as if the whole range had traffic).
+    firstRequestAt: stats.first_request_at ?? null,
   });
 });
 
 // Stats grouped by model
 analyticsRouter.get('/by-model', (req: Request, res: Response) => {
   const range = (req.query.range as string) ?? '7d';
-  const since = getTimeFilter(range);
+  const since = getSinceTimestamp(range);
   const db = getDb();
 
   const rows = db.prepare(`
@@ -63,13 +90,18 @@ analyticsRouter.get('/by-model', (req: Request, res: Response) => {
       SUM(CASE WHEN r.status = 'success' THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as success_rate,
       AVG(r.latency_ms) as avg_latency_ms,
       SUM(r.input_tokens) as total_input_tokens,
-      SUM(r.output_tokens) as total_output_tokens
+      SUM(r.output_tokens) as total_output_tokens,
+      SUM(CASE WHEN r.requested_model = r.model_id THEN 1 ELSE 0 END) as pinned_requests,
+      SUM(CASE WHEN r.status = 'success' THEN
+        r.input_tokens  * COALESCE(m.paid_input_per_m,  ?) / 1000000.0 +
+        r.output_tokens * COALESCE(m.paid_output_per_m, ?) / 1000000.0
+      ELSE 0 END) as est_cost
     FROM requests r
     LEFT JOIN models m ON m.platform = r.platform AND m.model_id = r.model_id
-    WHERE r.created_at >= ${since}
+    WHERE r.created_at >= ?
     GROUP BY r.platform, r.model_id
     ORDER BY requests DESC
-  `).all() as any[];
+  `).all(FALLBACK_INPUT_PER_M, FALLBACK_OUTPUT_PER_M, since) as any[];
 
   res.json(rows.map(r => ({
     platform: r.platform,
@@ -80,13 +112,16 @@ analyticsRouter.get('/by-model', (req: Request, res: Response) => {
     avgLatencyMs: Math.round(r.avg_latency_ms),
     totalInputTokens: r.total_input_tokens ?? 0,
     totalOutputTokens: r.total_output_tokens ?? 0,
+    // Requests this model served because the client pinned it by name.
+    pinnedRequests: r.pinned_requests ?? 0,
+    estimatedCost: Math.round((r.est_cost ?? 0) * 100) / 100,
   })));
 });
 
 // Stats grouped by platform
 analyticsRouter.get('/by-platform', (req: Request, res: Response) => {
   const range = (req.query.range as string) ?? '7d';
-  const since = getTimeFilter(range);
+  const since = getSinceTimestamp(range);
   const db = getDb();
 
   const rows = db.prepare(`
@@ -98,10 +133,10 @@ analyticsRouter.get('/by-platform', (req: Request, res: Response) => {
       SUM(input_tokens) as total_input_tokens,
       SUM(output_tokens) as total_output_tokens
     FROM requests
-    WHERE created_at >= ${since}
+    WHERE created_at >= ?
     GROUP BY platform
     ORDER BY requests DESC
-  `).all() as any[];
+  `).all(since) as any[];
 
   res.json(rows.map(r => ({
     platform: r.platform,
@@ -117,9 +152,10 @@ analyticsRouter.get('/by-platform', (req: Request, res: Response) => {
 analyticsRouter.get('/timeline', (req: Request, res: Response) => {
   const range = (req.query.range as string) ?? '7d';
   const interval = (req.query.interval as string) ?? (range === '24h' ? 'hour' : 'day');
-  const since = getTimeFilter(range);
+  const since = getSinceTimestamp(range);
   const db = getDb();
 
+  // dateFormat is a hardcoded whitelist — never user-controlled.
   const dateFormat = interval === 'hour' ? '%Y-%m-%dT%H:00:00' : '%Y-%m-%d';
 
   const rows = db.prepare(`
@@ -129,10 +165,10 @@ analyticsRouter.get('/timeline', (req: Request, res: Response) => {
       SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
       SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as failure_count
     FROM requests
-    WHERE created_at >= ${since}
+    WHERE created_at >= ?
     GROUP BY strftime('${dateFormat}', created_at)
     ORDER BY timestamp ASC
-  `).all() as any[];
+  `).all(since) as any[];
 
   res.json(rows.map(r => ({
     timestamp: r.timestamp,
@@ -145,7 +181,7 @@ analyticsRouter.get('/timeline', (req: Request, res: Response) => {
 // Error distribution (grouped by error type and platform)
 analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
   const range = (req.query.range as string) ?? '7d';
-  const since = getTimeFilter(range);
+  const since = getSinceTimestamp(range);
   const db = getDb();
 
   // Group errors by category (extract the key part of the error message)
@@ -165,10 +201,10 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
       END as error_category,
       COUNT(*) as count
     FROM requests
-    WHERE status = 'error' AND created_at >= ${since}
+    WHERE status = 'error' AND created_at >= ?
     GROUP BY platform, error_category
     ORDER BY count DESC
-  `).all() as any[];
+  `).all(since) as any[];
 
   // Also get totals by category
   const byCategory = db.prepare(`
@@ -185,19 +221,19 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
       END as category,
       COUNT(*) as count
     FROM requests
-    WHERE status = 'error' AND created_at >= ${since}
+    WHERE status = 'error' AND created_at >= ?
     GROUP BY category
     ORDER BY count DESC
-  `).all() as any[];
+  `).all(since) as any[];
 
   // Errors by platform
   const byPlatform = db.prepare(`
     SELECT platform, COUNT(*) as count
     FROM requests
-    WHERE status = 'error' AND created_at >= ${since}
+    WHERE status = 'error' AND created_at >= ?
     GROUP BY platform
     ORDER BY count DESC
-  `).all() as any[];
+  `).all(since) as any[];
 
   res.json({
     byCategory,
@@ -209,16 +245,16 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
 // Recent errors
 analyticsRouter.get('/errors', (req: Request, res: Response) => {
   const range = (req.query.range as string) ?? '7d';
-  const since = getTimeFilter(range);
+  const since = getSinceTimestamp(range);
   const db = getDb();
 
   const rows = db.prepare(`
     SELECT id, platform, model_id, error, latency_ms, created_at
     FROM requests
-    WHERE status = 'error' AND created_at >= ${since}
+    WHERE status = 'error' AND created_at >= ?
     ORDER BY created_at DESC
     LIMIT 50
-  `).all() as any[];
+  `).all(since) as any[];
 
   res.json(rows.map(r => ({
     id: r.id,

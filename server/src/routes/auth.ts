@@ -1,165 +1,119 @@
 import { Router } from 'express';
+import type { Request, Response } from 'express';
 import { z } from 'zod';
 import {
-  countUsers,
-  getDb,
-  getUserByUsername,
-  updateLastLogin,
-} from '../db/index.js';
-import {
-  dummyPasswordHashForTiming,
-  hashPassword,
-  validatePasswordPolicy,
-  verifyPassword,
-} from '../lib/passwords.js';
-import { normalizeUserIdentifier, validateUsername } from '@freellmapi/shared/validate-username.js';
-
-const FAIL_DELAY_MS = 400;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => {
-    setTimeout(r, ms);
-  });
-}
-
-const setupBody = z.object({
-  username: z.string().min(1),
-  password: z.string().min(1),
-  confirmPassword: z.string().min(1),
-});
-
-const loginBody = z.object({
-  username: z.string().min(1),
-  password: z.string().min(1),
-});
+  userCount,
+  createUser,
+  verifyCredentials,
+  createSession,
+  validateSession,
+  deleteSession,
+} from '../services/auth.js';
 
 export const authRouter = Router();
 
-authRouter.get('/status', (req, res) => {
+// Dashboard auth (#35). These routes are mounted BEFORE requireAuth, so
+// /status, /setup and /login are reachable without a session (bootstrap);
+// /logout and /me validate the token themselves.
+
+const credentialsSchema = z.object({
+  email: z.string().email('A valid email is required'),
+  password: z.string().min(8, 'Password must be at least 8 characters'),
+});
+
+// ── Brute-force throttle ──────────────────────────────────────────────────
+// Simple in-memory per-email limiter. A local single-user tool doesn't need a
+// distributed store; this just blunts online password guessing.
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_MS = 15 * 60 * 1000;
+const attempts = new Map<string, { count: number; lockedUntil: number }>();
+
+function isLockedOut(email: string): boolean {
+  const a = attempts.get(email.toLowerCase());
+  return !!a && a.lockedUntil > Date.now();
+}
+function recordFailure(email: string): void {
+  const key = email.toLowerCase();
+  const a = attempts.get(key) ?? { count: 0, lockedUntil: 0 };
+  a.count++;
+  if (a.count >= MAX_ATTEMPTS) {
+    a.lockedUntil = Date.now() + LOCKOUT_MS;
+    a.count = 0;
+  }
+  attempts.set(key, a);
+}
+function clearFailures(email: string): void {
+  attempts.delete(email.toLowerCase());
+}
+
+function bearer(req: Request): string | undefined {
+  return req.headers.authorization?.replace(/^Bearer\s+/i, '')
+    ?? (req.headers['x-dashboard-token'] as string | undefined);
+}
+
+// Has the dashboard been set up yet, and is this caller authenticated?
+authRouter.get('/status', (req: Request, res: Response) => {
+  const session = validateSession(bearer(req));
   res.json({
-    setupRequired: countUsers() === 0,
-    authenticated: req.session.userId != null,
+    needsSetup: userCount() === 0,
+    authenticated: !!session,
+    email: session?.email ?? null,
   });
 });
 
-authRouter.get('/me', (req, res) => {
-  if (req.session.userId == null) {
-    res.json({ user: null });
+// First-run account creation. Only allowed while there are zero users, so it
+// can't be used to add accounts once the dashboard is claimed.
+authRouter.post('/setup', (req: Request, res: Response) => {
+  if (userCount() > 0) {
+    res.status(409).json({ error: { message: 'Setup already completed. Use login instead.', type: 'setup_complete' } });
     return;
   }
-  res.json({
-    user: {
-      id: req.session.userId,
-      username: req.session.username,
-      role: req.session.role,
-    },
-  });
-});
-
-authRouter.post('/setup', async (req, res, next) => {
-  try {
-    const parsed = setupBody.safeParse(req.body);
-    if (!parsed.success) {
-      await sleep(FAIL_DELAY_MS);
-      res.status(400).json({ error: { message: 'Invalid body', type: 'validation_error' } });
-      return;
-    }
-    const { username, password, confirmPassword } = parsed.data;
-    const uErr = validateUsername(username);
-    if (uErr) {
-      await sleep(FAIL_DELAY_MS);
-      res.status(400).json({ error: { message: uErr, type: 'validation_error' } });
-      return;
-    }
-    const pErr = validatePasswordPolicy(password);
-    if (pErr) {
-      await sleep(FAIL_DELAY_MS);
-      res.status(400).json({ error: { message: pErr, type: 'validation_error' } });
-      return;
-    }
-    if (password !== confirmPassword) {
-      await sleep(FAIL_DELAY_MS);
-      res.status(400).json({ error: { message: 'Passwords do not match', type: 'validation_error' } });
-      return;
-    }
-
-    const loginId = normalizeUserIdentifier(username);
-    const db = getDb();
-    const passwordHash = await hashPassword(password);
-
-    const outcome = db.transaction(() => {
-      const c = (db.prepare('SELECT COUNT(*) as c FROM users').get() as { c: number }).c;
-      if (c > 0) {
-        return { kind: 'already_done' as const };
-      }
-      const r = db
-        .prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)')
-        .run(loginId, passwordHash, 'superadmin');
-      return {
-        kind: 'ok' as const,
-        userId: Number(r.lastInsertRowid),
-        username: loginId,
-        role: 'superadmin' as const,
-      };
-    })();
-
-    if (outcome.kind === 'already_done') {
-      res.status(409).json({ error: { message: 'Setup already completed', type: 'setup_already_done' } });
-      return;
-    }
-
-    req.session.userId = outcome.userId;
-    req.session.username = outcome.username;
-    req.session.role = outcome.role;
-    req.session.loggedInAt = Date.now();
-    await req.session.save();
-
-    res.status(201).json({
-      user: { id: outcome.userId, username: outcome.username, role: outcome.role },
-    });
-  } catch (e) {
-    next(e);
+  const parsed = credentialsSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    return;
   }
+  const user = createUser(parsed.data.email, parsed.data.password);
+  const token = createSession(user.userId);
+  res.status(201).json({ token, email: user.email });
 });
 
-authRouter.post('/login', async (req, res, next) => {
-  try {
-    const parsed = loginBody.safeParse(req.body);
-    if (!parsed.success) {
-      await sleep(FAIL_DELAY_MS);
-      res.status(400).json({ error: { message: 'Invalid body', type: 'validation_error' } });
-      return;
-    }
-    const { username, password } = parsed.data;
-    const uErrLogin = validateUsername(username);
-    if (uErrLogin) {
-      await sleep(FAIL_DELAY_MS);
-      res.status(400).json({ error: { message: uErrLogin, type: 'validation_error' } });
-      return;
-    }
-    const row = getUserByUsername(normalizeUserIdentifier(username));
-    const hashToCompare = row?.password_hash ?? dummyPasswordHashForTiming();
-    const passwordOk = await verifyPassword(password, hashToCompare);
-    if (!row || !passwordOk) {
-      await sleep(FAIL_DELAY_MS);
-      res.status(401).json({ error: { message: 'Invalid username or password', type: 'invalid_credentials' } });
-      return;
-    }
-
-    updateLastLogin(row.id);
-    req.session.userId = row.id;
-    req.session.username = row.username;
-    req.session.role = row.role;
-    req.session.loggedInAt = Date.now();
-    await req.session.save();
-
-    res.json({ user: { id: row.id, username: row.username, role: row.role } });
-  } catch (e) {
-    next(e);
+authRouter.post('/login', (req: Request, res: Response) => {
+  const parsed = credentialsSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    return;
   }
+  const { email, password } = parsed.data;
+
+  if (isLockedOut(email)) {
+    res.status(429).json({ error: { message: 'Too many failed attempts. Try again later.', type: 'rate_limit_error' } });
+    return;
+  }
+
+  const user = verifyCredentials(email, password);
+  if (!user) {
+    recordFailure(email);
+    // Same message whether the email exists or not — don't leak which.
+    res.status(401).json({ error: { message: 'Invalid email or password', type: 'authentication_error' } });
+    return;
+  }
+
+  clearFailures(email);
+  const token = createSession(user.userId);
+  res.json({ token, email: user.email });
 });
 
-authRouter.post('/logout', (req, res) => {
-  req.session.destroy();
-  res.json({ ok: true });
+authRouter.post('/logout', (req: Request, res: Response) => {
+  deleteSession(bearer(req));
+  res.json({ success: true });
+});
+
+authRouter.get('/me', (req: Request, res: Response) => {
+  const session = validateSession(bearer(req));
+  if (!session) {
+    res.status(401).json({ error: { message: 'Authentication required', type: 'authentication_error' } });
+    return;
+  }
+  res.json({ email: session.email });
 });
